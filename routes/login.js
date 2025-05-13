@@ -6,7 +6,7 @@ const { logger } = require("../modules/logger");
 const { Student } = require("../modules/student");
 const { STUDENT_PERMISSIONS, MANAGER_PERMISSIONS, GUEST_PERMISSIONS } = require("../modules/permissions");
 const { managerUpdate } = require("../modules/socketUpdates");
-const { sendMail, limitStore, RATE_LIMIT } = require('../modules/mail.js');
+const { sendMail, isRateLimited } = require('../modules/mail.js');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
@@ -141,7 +141,7 @@ module.exports = {
         // This lets users actually log in instead of not being able to log in at all
         // It uses the usernames, passwords, etc. to verify that it is the user that wants to log in logging in
         // This also hashes passwords to make sure people's accounts don't get hacked
-        app.post('/login', (req, res) => {
+        app.post('/login', async (req, res) => {
             try {
                 const user = {
                     password: req.body.password,
@@ -246,6 +246,17 @@ module.exports = {
                             logger.log('verbose', `[post /login] session=(${JSON.stringify(req.session)})`)
                             logger.log('verbose', `[post /login] classInformation=(${JSON.stringify(classInformation)})`)
 
+                            const signedAPI = jwt.sign({ API: userData.API }, privateKey, { algorithm: 'RS256', expiresIn: '1h' });
+                            const html = `
+                            <h1>Verify your email</h1>
+                            <p>Click the link below to verify your email address with Formbar</p>
+                            <a href='${req.protocol}://${req.get('host')}/verify?code=${signedAPI}'>Verify Email</a>
+                            `;
+                            sendMail(userData.email, 'Formbar Verification', html);
+                            isRateLimited(req.session.email) 
+                            ? logger.log('info', `[isVerified] Emails to ${req.session.email} has been rate limited. ${Math.ceil((limitStore.get(req.session.email) + RATE_LIMIT - Date.now())/1000)} seconds until rate limit expires.`)
+                            : logger.log('info', `[isVerified] Verification email sent to ${req.session.email}.`); limitStore.set(req.session.email, Date.now());
+
                             // If the user was logging in from the consent page, redirect them back to the consent page
                             if (req.body.route === 'transfer') {
                                 res.redirect(req.body.redirectURL);
@@ -263,7 +274,6 @@ module.exports = {
                         }
                     })
                 } else if (user.loginType == 'new') {
-                    // Check if the password and display name are valid
                     if (!passwordRegex.test(user.password) || !displayRegex.test(user.displayName)) {
                         logger.log('verbose', '[post /login] Invalid data provided to create new user');
                         res.render('pages/message', {
@@ -272,175 +282,53 @@ module.exports = {
                         });
                         return;
                     }
-
                     // Trim whitespace from email
                     user.email = user.email.trim()
-
                     logger.log('verbose', '[post /login] Creating new user')
                     let permissions = STUDENT_PERMISSIONS
-                    database.all('SELECT API, secret, username FROM users', async (err, users) => {
-                        try {
-                            if (err) throw err
-
-                            let existingAPIs = []
-                            let existingSecrets = []
-                            let newAPI
-                            let newSecret
-
-                            // If there are no users in the database, the first user is a manager
-                            if (users.length == 0) {
-                                permissions = MANAGER_PERMISSIONS
-                            }
-
-                            for (let dbUser of users) {
-                                existingAPIs.push(dbUser.API)
-                                existingSecrets.push(dbUser.secret)
-                                if (dbUser.username == user.username) {
-                                    logger.log('verbose', '[post /login] User already exists')
+                    const users = await dbGet('SELECT API, secret, username FROM users WHERE username=?', [user.username])
+                    if (!users) 
+                        permissions = MANAGER_PERMISSIONS
+                    const newAPI = crypto.randomBytes(32).toString('hex')
+                    database.run('INSERT INTO users(username, email, password, permissions, API, secret, displayName, verified) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                        [
+                            user.email,
+                            user.email,
+                            hash(user.password),
+                            permissions,
+                            newAPI,
+                            crypto.randomBytes(256).toString('hex'),
+                            user.displayName,
+                            0
+                        ], (err) => {
+                            if (err) {
+                                // Handle the same email being used for multiple accounts
+                                if (err.code === 'SQLITE_CONSTRAINT' && err.message.includes('UNIQUE constraint failed: users.email')) {
+                                    logger.log('verbose', '[post /login] Email already exists')
                                     res.render('pages/message', {
-                                        message: 'A user with that username already exists.',
+                                        message: 'A user with that email already exists.',
                                         title: 'Login'
-                                    })
-                                    return
-                                }
-                            }
-
-                            do {
-                                newAPI = crypto.randomBytes(32).toString('hex')
-                            } while (existingAPIs.includes(newAPI))
-
-                            do {
-                                newSecret = crypto.randomBytes(256).toString('hex')
-                            } while (existingSecrets.includes(newSecret))
-
-                            // Hash the provided password
-                            const hashedPassword = await hash(user.password);
-
-                            if (!settings.emailEnabled) {
-                                user.newAPI = newAPI;
-                                user.newSecret = newSecret;
-                                user.hashedPassword = hashedPassword;
-                                user.permissions = permissions;
-                                database.run(
-                                    'INSERT INTO users(username, email, password, permissions, API, secret, displayName, verified) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
-                                    [
-                                        user.username,
-                                        user.email,
-                                        user.hashedPassword,
-                                        user.permissions,
-                                        user.newAPI,
-                                        user.newSecret,
-                                        user.displayName,
-                                        1
-                                    ], (err) => {
-                                        try {
-                                            if (err) throw err
-                                            logger.log('verbose', '[get /login] Added user to database')
-                                            // Find the user in which was just created to get the id of the user
-                                            database.get('SELECT * FROM users WHERE username=?', [user.username], (err, userData) => {
-                                                try {
-                                                    if (err) throw err;
-                                                    classInformation.users[userData.email] = new Student(
-                                                        userData.email,
-                                                        userData.id,
-                                                        userData.permissions,
-                                                        userData.API,
-                                                        [],
-                                                        [],
-                                                        userData.tags,
-                                                        userData.displayName,
-                                                        false
-                                                    );
-                                                    // Add the user to the session in order to transfer data between each page
-                                                    req.session.userId = userData.id
-                                                    req.session.username = userData.email
-                                                    req.session.classId = null
-                                                    req.session.displayName = userData.displayName;
-                                                    req.session.email = userData.email;
-                                                    req.session.verified = 1;
-                                
-                                                    logger.log('verbose', `[post /login] session=(${JSON.stringify(req.session)})`)
-                                                    logger.log('verbose', `[post /login] classInformation=(${JSON.stringify(classInformation)})`)
-                                
-                                                    managerUpdate()
-                                
-                                                    res.redirect('/')
-                                                    return;
-                                                } catch (err) {
-                                                    logger.log('error', err.stack);
-                                                    res.render('pages/message', {
-                                                        message: `Error Number ${logNumbers.error}: There was a server error try again.`,
-                                                        title: 'Error'
-                                                    });
-                                                    return;
-                                                };
-                                            });
-                                        } catch (err) {
-                                            // Handle the same email being used for multiple accounts
-                                            if (err.code === 'SQLITE_CONSTRAINT' && err.message.includes('UNIQUE constraint failed: users.email')) {
-                                                logger.log('verbose', '[post /login] Email already exists')
-                                                res.render('pages/message', {
-                                                    message: 'A user with that email already exists.',
-                                                    title: 'Login'
-                                                });
-                                                return;
-                                            }
-                                
-                                            // Handle other errors
-                                            logger.log('error', err.stack);
-                                            res.render('pages/message', {
-                                                message: `Error Number ${logNumbers.error}: There was a server error try again.`,
-                                                title: 'Error'
-                                            })
-                                            return;
-                                        };
                                     });
-                                return;
-                            };
-
-                            // Set the creation data for the user
-                            const accountCreationData = user;
-                            accountCreationData.newAPI = newAPI;
-                            accountCreationData.newSecret = newSecret;
-                            accountCreationData.hashedPassword = hashedPassword;
-                            accountCreationData.permissions = permissions;
-
-                            // Create JWT token with this information then store it in the temp_user_creation_data in the database
-                            // This will be used to finish creating the account once the email is verified
-                            const token = jwt.sign(accountCreationData, newSecret, { expiresIn: '1h' });
-                            await dbRun('INSERT INTO temp_user_creation_data(token, secret) VALUES(?, ?)', [token, newSecret]);
-
-                            // Get the web address for Formbar to send in the email
-                            const location = `${req.protocol}://${req.get('host')}`;
-
-                            // Create the HTML content for the email
-                            const html = `
-                            <h1>Verify your email</h1>
-                            <p>Click the link below to verify your email address with Formbar</p>
-                                <a href='${location}/login?code=${newSecret}'>Verify Email</a>
-                            `;
-
-                            // Send the email
-                            sendMail(user.email, 'Formbar Verification', html);
-                            if (limitStore.has(user.email) && (Date.now() - limitStore.get(user.email) < RATE_LIMIT)) {
+                                    return;
+                                }
+                                logger.log('error', err.stack);
                                 res.render('pages/message', {
-                                    message: `Email has been rate limited. Please wait ${Math.ceil((limitStore.get(user.email) + RATE_LIMIT - Date.now())/1000)} seconds.`,
-                                    title: 'Verification'
-                                });
-                            } else {
-                                res.render('pages/message', {
-                                    message: 'Verification email sent. Please check your email.',
-                                    title: 'Verification'
-                                });
-                            };
-                        } catch (err) {
-                            logger.log('error', err.stack);
-                            res.render('pages/message', {
-                                message: `Error Number ${logNumbers.error}: There was a server error try again.`,
-                                title: 'Error'
-                            })
-                        }
-                    })
+                                    message: `Error Number ${logNumbers.error}: There was a server error try again.`,
+                                    title: 'Error'
+                                })
+                            }
+                            logger.log('verbose', '[post /login] Added user to database')
+                        });
+                        const signedAPI = jwt.sign({ API: newAPI }, privateKey, { algorithm: 'RS256', expiresIn: '1h' });
+                        const html = `
+                        <h1>Verify your email</h1>
+                        <p>Click the link below to verify your email address with Formbar</p>
+                        <a href='${req.protocol}://${req.get('host')}/verify?code=${signedAPI}'>Verify Email</a>
+                        `;
+                        sendMail(user.email, 'Formbar Verification', html);
+                        isRateLimited(req.session.email) 
+                        ? logger.log('info', `[isVerified] Emails to ${req.session.email} has been rate limited. ${Math.ceil((limitStore.get(req.session.email) + RATE_LIMIT - Date.now())/1000)} seconds until rate limit expires.`)
+                        : logger.log('info', `[isVerified] Verification email sent to ${req.session.email}.`); limitStore.set(req.session.email, Date.now());
                 } else if (user.loginType == 'guest') {
                     if (user.displayName.trim() == '') {
                         logger.log('verbose', '[post /login] Invalid display name provided to create guest user');

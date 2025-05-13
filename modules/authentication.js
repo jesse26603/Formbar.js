@@ -3,6 +3,9 @@ const { classInformation } = require("./class")
 const { logNumbers, settings } = require("./config")
 const { MANAGER_PERMISSIONS, TEACHER_PERMISSIONS, PAGE_PERMISSIONS, GUEST_PERMISSIONS } = require("./permissions")
 const fs = require('fs');
+const { dbGet } = require("./database");
+const jwt = require('jsonwebtoken');
+const { sendMail, isRateLimited } = require('./mail');
 
 const whitelistedIps = {}
 const blacklistedIps = {}
@@ -48,6 +51,18 @@ function isVerified(req, res, next) {
 			// If the user is verified or email functionality is disabled...
 			if (req.session.verified || !settings.emailEnabled || classInformation.users[req.session.username].permissions == GUEST_PERMISSIONS) {
 				next();
+			} else if(settings.emailEnabled && !req.session.verified) {
+				const API = dbGet('SELECT API FROM users WHERE id = ?', [req.session.userId]);
+				const signedAPI = jwt.sign({ API }, privateKey, { algorithm: 'RS256', expiresIn: '1h' });
+				const html = `
+				<h1>Verify your email</h1>
+				<p>Click the link below to verify your email address with Formbar</p>
+				<a href='${req.protocol}://${req.get('host')}/login?code=${signedAPI}'>Verify Email</a>
+				`;
+				sendMail(req.session.email, 'Formbar Verification', html);
+				isRateLimited(req.session.email) 
+				? logger.log('info', `[isVerified] Emails to ${req.session.email} has been rate limited. ${Math.ceil((limitStore.get(req.session.email) + RATE_LIMIT - Date.now())/1000)} seconds until rate limit expires.`)
+				: logger.log('info', `[isVerified] Verification email sent to ${req.session.email}.`); limitStore.set(req.session.email, Date.now());
 			} else {
 				// Redirect to the login page
 				res.redirect('/login');

@@ -6,7 +6,7 @@ const limitStore = new Map();
 const RATE_LIMIT = 60 * 1000; // 1 minute
 
 // Create a function for sending mail, passing the recipient, subject, and HTML content as arguments
-const sendMail = (recipient, subject, html) => {
+function sendMail(recipient, subject, html) {
     if (!settings.emailEnabled) return;
     // Access the email user and password from the environmental variable
     const emailPassword = process.env.EMAIL_PASSWORD;
@@ -59,9 +59,15 @@ const sendMail = (recipient, subject, html) => {
     });
 };
 
+function isRateLimited(email) {
+    // Check if the email is in the limitStore and if the rate limit has expired
+    return limitStore.has(email) && (Date.now() - limitStore.get(email) < RATE_LIMIT);
+}
+
 // Export the sendMail function
 module.exports = {
     sendMail,
+    isRateLimited,
     limitStore,
     RATE_LIMIT
 };

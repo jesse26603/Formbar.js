@@ -36,7 +36,7 @@ async function isEnabled(req, res, next) {
 let plugins = {};
 async function configPlugins(app) {
     const pluginDirs = fs.readdirSync('plugins');
-
+    console.log(pluginDirs);
     for (let i = 0; i < pluginDirs.length; i++) {
         let pluginDir = pluginDirs[i];
         const pluginPath = `plugins/${pluginDir}`;
@@ -81,6 +81,7 @@ async function configPlugins(app) {
                     dbGet('SELECT id FROM plugins WHERE name=?', [pluginName])
                         .then((row) => {
                             plugins[row.id] = plugin;
+                            console.log(plugins)
                         });
                 } else {
                     logger.warning(`No init function found in plugin: ${plugin.name || pluginDir}`);
@@ -93,6 +94,7 @@ async function configPlugins(app) {
         } else {
             logger.warning(`Plugin ${pluginDir.slice(0, -4)} was not extracted`);
         }
+        console.log(plugins)
     }
 
     logger.log('info', `Loaded ${Object.keys(plugins).length} plugin(s).`);
